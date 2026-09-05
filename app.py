@@ -51,73 +51,65 @@ HEX_KEY = bytes.fromhex("3265653434383139653962343539383834353134313036376232383
 
 OPT = {'timeout': 10, 'retries': 2, 'backoff': 0.5}
 
-# ---------------- IP SPOOFING ---------------- #
-class FastIPSpoofer:
-    _IP_POOL = []
-    _IP_INDEX = 0
-    _IP_LOCK = threading.Lock()
-
-    @classmethod
-    def init_ip_pool(cls, count=5000):
-        if not cls._IP_POOL:
-            for _ in range(count):
-                a = random.randint(1,254)
-                b = random.randint(0,255)
-                c = random.randint(0,255)
-                d = random.randint(1,254)
-                cls._IP_POOL.append(f"{a}.{b}.{c}.{d}")
-
-    @classmethod
-    def get_ip(cls):
-        with cls._IP_LOCK:
-            ip = cls._IP_POOL[cls._IP_INDEX % len(cls._IP_POOL)]
-            cls._IP_INDEX += 1
-            return ip
-
-FastIPSpoofer.init_ip_pool(5000)
-
-# ---------------- WAF BYPASS ---------------- #
-class WAFBypass:
-    _uas = [
-        "GarenaMSDK/4.0.42(SM-A525F ;Android)",
-        "GarenaMSDK/4.0.39(SM-A325M;Android 13;en;HK;)",
-        "GarenaMSDK/4.0.38(Redmi Note 10;Android 12;en;ID;)",
-        "GarenaMSDK/4.0.40(Poco X3;Android 11;en;SG;)",
-        "GarenaMSDK/4.0.41(SM-S918B;Android 14;en;IN;)",
-        "GarenaMSDK/4.0.42(OnePlus 11;Android 13;en;US;)",
-        "GarenaMSDK/4.0.39(Xiaomi 13 Pro;Android 13;pt;BR;)",
-        "GarenaMSDK/4.0.40(Pixel 7 Pro;Android 14;en;US;)"
-    ]
-
-    @staticmethod
-    def get_ua():
-        return random.choice(WAFBypass._uas)
-
+# ---------------- UPSTREAM STABILITY ---------------- #
+# Keep concurrency bounded so simultaneous /gen requests do not create
+# an uncontrolled burst against the upstream service.
+UPSTREAM_MAX_WORKERS = 4
+UPSTREAM_CONCURRENCY = threading.BoundedSemaphore(UPSTREAM_MAX_WORKERS)
 thread_local = threading.local()
+
+UA = "LIPZX-API/3.3"
 
 def get_session():
     if not hasattr(thread_local, "session"):
         thread_local.session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=8,
+            pool_maxsize=8,
+            max_retries=0,
+        )
+        thread_local.session.mount("https://", adapter)
+        thread_local.session.headers.update({"User-Agent": UA})
     return thread_local.session
 
 def request_retry(method, url, **kwargs):
     session = get_session()
-    for attempt in range(OPT['retries'] + 1):
+    timeout = kwargs.pop("timeout", OPT["timeout"])
+    transient = {408, 429, 500, 502, 503, 504}
+
+    for attempt in range(OPT["retries"] + 1):
         try:
-            if 'timeout' not in kwargs:
-                kwargs['timeout'] = OPT['timeout']
-            kwargs['verify'] = False
-            resp = session.request(method, url, **kwargs)
-            if resp.status_code in [429, 500, 502, 503, 504, 408]:
-                if attempt < OPT['retries']:
-                    time.sleep(OPT['backoff'] * (attempt + 1))
-                    continue
+            kwargs["timeout"] = timeout
+            # Do not spoof source identity or attempt to bypass upstream controls.
+            with UPSTREAM_CONCURRENCY:
+                resp = session.request(method, url, **kwargs)
+
+            if resp.status_code in transient and attempt < OPT["retries"]:
+                retry_after = resp.headers.get("Retry-After")
+                try:
+                    delay = min(float(retry_after), 15.0) if retry_after else None
+                except (TypeError, ValueError):
+                    delay = None
+
+                if delay is None:
+                    delay = min(
+                        OPT["backoff"] * (2 ** attempt) + random.uniform(0, 0.25),
+                        8.0,
+                    )
+                time.sleep(delay)
+                continue
+
             return resp
-        except:
-            if attempt < OPT['retries']:
-                time.sleep(OPT['backoff'] * (attempt + 1))
+        except requests.RequestException:
+            if attempt < OPT["retries"]:
+                delay = min(
+                    OPT["backoff"] * (2 ** attempt) + random.uniform(0, 0.25),
+                    8.0,
+                )
+                time.sleep(delay)
                 continue
             return None
+
     return None
 
 # ---------------- PROTOBUF & AES ---------------- #
@@ -289,11 +281,8 @@ def major_login(uid, password, access_token, open_id, region, is_ghost):
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
             "ReleaseVersion": "OB54",
-            "User-Agent": WAFBypass.get_ua(),
             "X-GA": "v1 1",
             "X-Unity-Version": "2018.4.11f1",
-            "X-Forwarded-For": FastIPSpoofer.get_ip(),
-            "X-Real-IP": FastIPSpoofer.get_ip(),
         }
         data = payload.replace(b'afcfbf13334be42036e4f742c80b956344bed760ac91b3aff9b607a610ab4390', access_token.encode())
         data = data.replace(b'1d8ec0240ede109973f3321b9354b44d', open_id.encode())
@@ -330,11 +319,8 @@ def major_register(access_token, open_id, field, uid, password, region, account_
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
             "ReleaseVersion": "OB54",
-            "User-Agent": WAFBypass.get_ua(),
             "X-GA": "v1 1",
             "X-Unity-Version": "2018.4.",
-            "X-Forwarded-For": FastIPSpoofer.get_ip(),
-            "X-Real-IP": FastIPSpoofer.get_ip(),
         }
         lang = "pt" if is_ghost else REGION_LANG.get(region.upper(), "en")
         payload = {1: name, 2: access_token, 3: open_id, 5: 102000007, 6: 4, 7: 1, 13: 1, 14: field, 15: lang, 16: 1, 17: 1}
@@ -376,9 +362,6 @@ def get_token(uid, password, region, account_name, password_prefix, is_ghost, th
         url = "https://100067.connect.garena.com/oauth/guest/token/grant"
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": WAFBypass.get_ua(),
-            "X-Forwarded-For": FastIPSpoofer.get_ip(),
-            "X-Real-IP": FastIPSpoofer.get_ip(),
         }
         body = {"uid": uid, "password": password, "response_type": "token", "client_type": "2", "client_secret": HEX_KEY, "client_id": "100067"}
         resp = request_retry('POST', url, headers=headers, data=body)
@@ -417,15 +400,12 @@ def create_single_account(args):
             signature = hmac.new(HEX_KEY, body_json.encode("utf-8"), hashlib.sha256).hexdigest()
             
             headers = {
-                "User-Agent": WAFBypass.get_ua(),
                 "Connection": "Keep-Alive",
                 "Accept": "application/json",
                 "Accept-Encoding": "gzip",
                 "Authorization": f"Signature {signature}",
                 "Content-Type": "application/json; charset=utf-8",
                 "Host": "100067.connect.garena.com",
-                "X-Forwarded-For": FastIPSpoofer.get_ip(),
-                "X-Real-IP": FastIPSpoofer.get_ip(),
             }
             
             resp = request_retry('POST', url, headers=headers, data=body_json)
@@ -435,9 +415,9 @@ def create_single_account(args):
                     uid = res["data"]["uid"]
                     return get_token(uid, password, region, name_prefix, password_prefix, is_ghost, threshold)
             return None
-        except:
-            if retry_no < 4:
-                time.sleep(0.35 * (retry_no + 1))
+        except requests.RequestException:
+            if retry_no < 1:
+                time.sleep(0.75 + random.uniform(0, 0.35))
                 continue
             return None
 
@@ -450,7 +430,7 @@ def home():
     return jsonify({
         "status": "online",
         "service": "FreeFire Account Generator API",
-        "version": "3.2",
+        "version": "3.3-stable",
         "endpoint": "/gen?name=NAME&count=COUNT&region=REGION&password_prefix=PREFIX&ghost=BOOLEAN&threshold=NUMBER",
         "available_regions": list(REGION_LANG.keys())
     })
@@ -483,6 +463,7 @@ def generate_accounts():
     try:
         count = int(count)
         if count < 1: count = 1
+        if count > 20: count = 20
     except:
         count = 1
 
@@ -497,8 +478,8 @@ def generate_accounts():
 
     results = []
     rare_accounts = []
-    max_workers = min(count, 20)
-    max_attempts = count * 5
+    max_workers = min(count, UPSTREAM_MAX_WORKERS)
+    max_attempts = count * 2
     attempts = 0
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -523,7 +504,7 @@ def generate_accounts():
                     break
 
     return jsonify({
-        "success": True,
+        "success": len(results) == count,
         "total_requested": count,
         "total_created": len(results),
         "rare_count": len(rare_accounts),
