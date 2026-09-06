@@ -49,11 +49,7 @@ def after_request(response):
 REGION_LANG = {"ME":"ar","IND":"hi","ID":"id","VN":"vi","TH":"th","BD":"bn","PK":"ur","TW":"zh","CIS":"ru","SAC":"es","BR":"pt"}
 HEX_KEY = bytes.fromhex("32656534343831396539623435393838343531343130363762323831363231383734643064356437616639643866376530306331653534373135623764316533")
 
-OPT = {
-    'timeout': (3, 7),
-    'retries': 1,
-    'backoff': 0.25
-}
+OPT = {'timeout': 10, 'retries': 2, 'backoff': 0.5}
 
 # ---------------- IP SPOOFING ---------------- #
 class FastIPSpoofer:
@@ -405,7 +401,7 @@ def create_single_account(args):
 
     # Retry the complete pipeline on transient failures so callers see
     # fewer None results.
-    for retry_no in range(3):
+    for retry_no in range(5):
         try:
             rand_part = "".join(random.choices("0123456789ABCDEF", k=16))
             password = f"{password_prefix}_{rand_part}"
@@ -501,8 +497,8 @@ def generate_accounts():
 
     results = []
     rare_accounts = []
-    max_workers = min(count, 30)
-    max_attempts = count * 3
+    max_workers = min(count, 20)
+    max_attempts = count * 5
     attempts = 0
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -517,12 +513,7 @@ def generate_accounts():
 
             for future in concurrent.futures.as_completed(futures):
                 attempts += 1
-
-                try:
-                    res = future.result()
-                except Exception:
-                    res = None
-
+                res = future.result()
                 if res and res.get('status') == "success":
                     results.append(res)
                     if res.get('is_rare'):
