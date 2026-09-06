@@ -49,34 +49,23 @@ def after_request(response):
 REGION_LANG = {"ME":"ar","IND":"hi","ID":"id","VN":"vi","TH":"th","BD":"bn","PK":"ur","TW":"zh","CIS":"ru","SAC":"es","BR":"pt"}
 HEX_KEY = bytes.fromhex("32656534343831396539623435393838343531343130363762323831363231383734643064356437616639643866376530306331653534373135623764316533")
 
-OPT = {'timeout': 10, 'retries': 2, 'backoff': 0.5}
+# Timeout diturunkan & retries dibatasi agar thread cepat lepas jika target slow response
+OPT = {'timeout': 5, 'retries': 1, 'backoff': 0.2}
 
 # ---------------- IP SPOOFING ---------------- #
 class FastIPSpoofer:
-    _IP_POOL = []
+    _IP_POOL = [f"{random.randint(1,254)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}" for _ in range(5000)]
     _IP_INDEX = 0
     _IP_LOCK = threading.Lock()
 
     @classmethod
-    def init_ip_pool(cls, count=5000):
-        if not cls._IP_POOL:
-            for _ in range(count):
-                a = random.randint(1,254)
-                b = random.randint(0,255)
-                c = random.randint(0,255)
-                d = random.randint(1,254)
-                cls._IP_POOL.append(f"{a}.{b}.{c}.{d}")
-
-    @classmethod
     def get_ip(cls):
         with cls._IP_LOCK:
-            ip = cls._IP_POOL[cls._IP_INDEX % len(cls._IP_POOL)]
+            ip = cls._IP_POOL[cls._IP_INDEX % 5000]
             cls._IP_INDEX += 1
             return ip
 
-FastIPSpoofer.init_ip_pool(5000)
-
-# ---------------- WAF BYPASS ---------------- #
+# ---------------- WAF BYPASS & HTTP SESSION ---------------- #
 class WAFBypass:
     _uas = [
         "GarenaMSDK/4.0.42(SM-A525F ;Android)",
@@ -97,7 +86,16 @@ thread_local = threading.local()
 
 def get_session():
     if not hasattr(thread_local, "session"):
-        thread_local.session = requests.Session()
+        session = requests.Session()
+        # Mengatur HTTP Adapter dengan connection pooling besar untuk High Concurrency
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=100, 
+            pool_maxsize=100, 
+            max_retries=0
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        thread_local.session = session
     return thread_local.session
 
 def request_retry(method, url, **kwargs):
@@ -399,9 +397,8 @@ def get_token(uid, password, region, account_name, password_prefix, is_ghost, th
 def create_single_account(args):
     region, name_prefix, password_prefix, is_ghost, threshold = args
 
-    # Retry the complete pipeline on transient failures so callers see
-    # fewer None results.
-    for retry_no in range(5):
+    # Batasi percobaan internal agar tidak memblokir worker thread terlalu lama
+    for retry_no in range(2):
         try:
             rand_part = "".join(random.choices("0123456789ABCDEF", k=16))
             password = f"{password_prefix}_{rand_part}"
@@ -418,7 +415,7 @@ def create_single_account(args):
             
             headers = {
                 "User-Agent": WAFBypass.get_ua(),
-                "Connection": "Keep-Alive",
+                "Connection": "keep-alive",
                 "Accept": "application/json",
                 "Accept-Encoding": "gzip",
                 "Authorization": f"Signature {signature}",
@@ -436,10 +433,13 @@ def create_single_account(args):
                     return get_token(uid, password, region, name_prefix, password_prefix, is_ghost, threshold)
             return None
         except:
-            if retry_no < 4:
-                time.sleep(0.35 * (retry_no + 1))
+            if retry_no < 1:
+                time.sleep(0.1)
                 continue
             return None
+
+# Global Thread Pool Executor untuk digunakan bersama di seluruh API
+GLOBAL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=100)
 
 # ---------------- API ENDPOINTS ---------------- #
 @app.route('/', methods=['GET', 'OPTIONS'])
@@ -450,7 +450,7 @@ def home():
     return jsonify({
         "status": "online",
         "service": "FreeFire Account Generator API",
-        "version": "3.2",
+        "version": "3.3 (High-Concurrency Optimized)",
         "endpoint": "/gen?name=NAME&count=COUNT&region=REGION&password_prefix=PREFIX&ghost=BOOLEAN&threshold=NUMBER",
         "available_regions": list(REGION_LANG.keys())
     })
@@ -481,7 +481,7 @@ def generate_accounts():
         threshold = request.args.get('threshold', '8')
 
     try:
-        count = int(count)
+        count = min(int(count), 50) # Maksimal per request diset 50 agar API tetap responsif
         if count < 1: count = 1
     except:
         count = 1
@@ -497,43 +497,19 @@ def generate_accounts():
 
     results = []
     rare_accounts = []
-    max_workers = min(count, 20)
-    max_attempts = count * 5
-    attempts = 0
+    
+    # Menjalankan tugas langsung melalui Global Thread Pool
+    tasks = [
+        GLOBAL_EXECUTOR.submit(create_single_account, (region, name, password_prefix, is_ghost, threshold))
+        for _ in range(count)
+    ]
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        while len(results) < count and attempts < max_attempts:
-            needed = count - len(results)
-            current_batch = min(needed, max_workers)
-
-            futures = [
-                executor.submit(create_single_account, (region, name, password_prefix, is_ghost, threshold))
-                for _ in range(current_batch)
-            ]
-
-            for future in concurrent.futures.as_completed(futures):
-                attempts += 1
-                try:
-                    res = future.result()
-                except Exception:
-                    # Error worker langsung di-skip tanpa ditampilkan/disimpan.
-                    continue
-
-                # Hanya hasil valid/success yang boleh masuk hasil atau disimpan.
-                if not res or res.get('status') != "success":
-                    continue
-
-                # Pastikan account_id juga valid; N/A/None/error tidak diteruskan.
-                account_id = res.get('account_id')
-                if not account_id or str(account_id).upper() in ("N/A", "NONE", "ERROR"):
-                    continue
-
-                results.append(res)
-                if res.get('is_rare'):
-                    rare_accounts.append(res)
-
-                if len(results) >= count:
-                    break
+    for future in concurrent.futures.as_completed(tasks):
+        res = future.result()
+        if res and res.get('status') == "success":
+            results.append(res)
+            if res.get('is_rare'):
+                rare_accounts.append(res)
 
     return jsonify({
         "success": True,
@@ -549,4 +525,5 @@ def application(environ, start_response):
     return app(environ, start_response)
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=3000, debug=False)
+    # Untuk local development, gunakan threaded mode (Production WAJIB pakai Gunicorn/Gevent)
+    app.run(host='0.0.0.0', port=3000, debug=False, threaded=True)
